@@ -487,14 +487,20 @@ def scan(quick=True, top=12, want=3, verbose=True, final=None, strict_colo=None,
     n_final = final if final is not None else max(top, want * 3)
     near_pool = near[:n_final]
     rest_pool = rest[:max(0, n_final - len(near_pool))]
-    ranked_near = run_domain_round(near_pool, domains, verbose=verbose)
-    ranked_rest = run_domain_round(rest_pool, domains, verbose=verbose)
-    ranked = ranked_near + ranked_rest
-    # 近端/远端的拼接会打乱 run_domain_round 内部的「合格优先」次序，
-    # 这里整体重排一次：合格的在前（按 p50），淘汰的垫后（按 p95）。
-    ranked.sort(key=lambda r: (bool(r.get("p95_reject")),
-                               r.get("p50") or 0,
-                               r.get("p95") or 0))
+    # 两轮并成一轮执行。near_pool / rest_pool 在开跑前就已确定，第二轮不读
+    # 第一轮的任何结果，拆成两个 20s 窗口纯粹是白等——曾经为了测 1~2 个兜底
+    # IP 而多等满一整个窗口（约 20s）。
+    #
+    # 合并不会抬高链路压力：两个池子的总量受 n_final 约束，而 run_domain_round
+    # 的候选间并发固定为 DOMAIN_WORKERS，峰值探测数不变。
+    #
+    # 排序结果不变：合并后只保留 run_domain_round 内部那一次排序，它用的
+    # 规则是「合格组按 (p50, p95)，被淘汰组垫底按 (p95, p50)」。原先这里的
+    # 全量重排把被淘汰组改成按 (p50, p95) 排——而按 p95 才是 run_domain_round
+    # 注释所写的「最不坏的那些」，所以合并后生效的是原本的意图。
+    # 这个差别只在「合格候选不足、必须降级取用淘汰项」时才可能影响名次，
+    # 且 scan_verified 取用前会再按 (reject, p50) 稳一次序，最终选谁不变。
+    ranked = run_domain_round(near_pool + rest_pool, domains, verbose=verbose)
     return ranked[:max(want, 6)]
 
 
