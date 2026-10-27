@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 本工具运行产物
+cf_choice.json
+*.bak.*
+hosts.bak.*
+
+# 测试数据（仅供参考，不随仓库分发）
+*_results.json
+*_report.txt
+ab_results.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
