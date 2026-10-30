@@ -37,6 +37,8 @@ import ssl
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 # ----------------------------------------------------------------- 常量
@@ -265,6 +267,7 @@ def domain_p95(ip, domain, port=443, window_s=FINAL_WINDOW_S,
            "User-Agent: cf-pin\r\nConnection: close\r\n\r\n").encode()
 
     samples, timeouts, colo = [], 0, None
+    blocked = 0                      # 非 0：该 IP 对这个域名返回了 4xx/5xx
     deadline = time.perf_counter() + window_s
 
     while time.perf_counter() < deadline:
@@ -277,14 +280,36 @@ def domain_p95(ip, domain, port=443, window_s=FINAL_WINDOW_S,
                 head = s.recv(1024)                # 首字节到达即停，不读完整个响应
                 if not head:
                     raise OSError("empty response")
+                # 4xx/5xx 不是「慢」，是「这个 IP 根本不给这个域名服务」。
+                # 典型是 CF 的 403 + error code 1034：该 IP 不在这个 zone 的
+                # anycast 分配里。这种 IP 延迟可能很好看，写进 hosts 后用户
+                # 打开就是一张错误页——所以必须当失败样本处理，不能进 p50。
+                status = head.split(b" ", 2)[1] if b" " in head else b""
+                if status.isdigit() and int(status) >= 400:
+                    blocked = int(status)
+                    raise OSError(f"http {blocked}")
+                if colo is None:
+                    # CF 在响应头里塞了 __cf_bm 之类几百字节的 cookie 后，
+                    # 整个响应常超过 1KB，colo 行会落在首包之外（实测
+                    # www.cloudflare.com 达 1141 字节，而首包只有 1024）。
+                    # colo 只需要第一个样本，补读到拿到为止即可，
+                    # 「首字节即停」的采样节奏不受影响。
+                    buf = head
+                    while len(buf) < 8192:
+                        m = re.search(rb"^colo=(\S+)$", buf, re.M)
+                        if m:
+                            colo = m.group(1).decode("ascii", "replace")
+                            break
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
             samples.append((time.perf_counter() - t0) * 1000)
-            if colo is None:
-                m = re.search(rb"^colo=(\S+)$", head, re.M)
-                if m:
-                    colo = m.group(1).decode("ascii", "replace")
         except OSError:
             timeouts += 1
             samples.append(float(penalty_ms))
+            if blocked:             # 状态码错误一次就够，不必空转满整个窗口
+                break
         except ssl.SSLError:
             timeouts += 1
             samples.append(float(penalty_ms))
@@ -295,12 +320,14 @@ def domain_p95(ip, domain, port=443, window_s=FINAL_WINDOW_S,
 
     if not samples:
         return {"domain": domain, "colo": colo, "n": 0, "p50": None,
-                "p95": float(penalty_ms), "loss": 100.0, "timeouts": 0}
+                "p95": float(penalty_ms), "loss": 100.0, "timeouts": 0,
+                "blocked": blocked}
     samples.sort()
     return {
         "domain": domain,
         "colo": colo,
         "n": len(samples),
+        "blocked": blocked,
         "p50": round(percentile(samples, 0.50), 1),
         "p95": round(percentile(samples, 0.95), 1),
         "loss": round(100.0 * timeouts / len(samples), 1),
@@ -370,11 +397,57 @@ def throughput(ip, kib=1024, timeout=15.0):
 
 
 # ----------------------------------------------------------------- 扫描
+# Cloudflare 官方免费接口，无需任何 token：返回当前全部边缘网段。
+# 内置的 CF_RANGES_V4 是快照，官方迟早会改；`cf_pin.py ranges --refresh`
+# 拉一次存本地，之后自动优先用缓存，拉不到就静默回退内置列表。
+CF_RANGES_API = "https://api.cloudflare.com/client/v4/ips"
+CF_RANGES_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "cf_ranges.json")
+
+
+def fetch_official_ranges(timeout=15.0):
+    """从官方接口取最新 IPv4 网段。失败返回 None，由调用方回退。"""
+    try:
+        req = urllib.request.Request(CF_RANGES_API,
+                                     headers={"User-Agent": "cf-pin"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not data.get("success"):
+            return None
+        return [c for c in data["result"]["ipv4_cidrs"] if "/" in c]
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        return None
+
+
+def load_ranges(refresh=False):
+    """返回 (网段列表, 来源说明)。refresh=True 时先联网拉一次再缓存。"""
+    if refresh:
+        got = fetch_official_ranges()
+        if got:
+            try:
+                with open(CF_RANGES_CACHE, "w", encoding="utf-8") as f:
+                    json.dump({"fetched_at": int(time.time()),
+                               "ipv4_cidrs": got}, f,
+                              ensure_ascii=False, indent=2)
+            except OSError:
+                pass
+            return got, f"官方接口（{len(got)} 段，已缓存）"
+    try:
+        with open(CF_RANGES_CACHE, encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached.get("ipv4_cidrs"):
+            age = (time.time() - cached.get("fetched_at", 0)) / 86400
+            return cached["ipv4_cidrs"], f"本地缓存（{age:.0f} 天前抓取）"
+    except (OSError, ValueError):
+        pass
+    return list(CF_RANGES_V4), "内置列表"
+
+
 def build_candidates(quick=True):
     """构造候选 IP 列表。
 
-    quick=True （默认）：只扫 PRIORITY_RANGES 两段、隔 4 个 /24 取 1，约 128 个。
-                        实测这一步就能拿到 11 个近端机房候选，比全量还多。
+    quick=True （默认）：只扫 PRIORITY_RANGES 两段、隔 2 个 /24 取 1，约 256 个。
+                        实测这一步就能拿到 12 个近端机房候选，比全量还多。
     quick=False（--full）：扫 CF_RANGES_V4 全部官方段。这是逃生通道：
                         链路状况变了、或关键段被阻断时仍有兜底。
                         其余每段抽样 20 个 /24，避免候选数爆炸。
@@ -387,8 +460,9 @@ def build_candidates(quick=True):
     if not quick:
         # 补齐其余官方段。已被 PRIORITY_RANGES 覆盖的段跳过：
         # 那些段已经按隔 N 取 1 取过了，再按 20 个 /24 抽一遍只是重复。
+        all_ranges, _ = load_ranges()
         prio_nets = [ipaddress.ip_network(c) for c, _ in PRIORITY_RANGES]
-        for cidr in CF_RANGES_V4:
+        for cidr in all_ranges:
             net = ipaddress.ip_network(cidr)
             if any(net.subnet_of(p) or p.subnet_of(net) for p in prio_nets):
                 continue
@@ -524,8 +598,11 @@ def run_domain_round(cands, domains, verbose=True):
         p50s = [v["p50"] for v in per.values() if v["p50"] is not None]
         n_total = sum(v["n"] for v in per.values())
         to_total = sum(v["timeouts"] for v in per.values())
+        # 只要有一个域名回 4xx/5xx，这个 IP 对用户就是不可用的
+        codes = [v["blocked"] for v in per.values() if v.get("blocked")]
         return {**r,
                 "per_domain": per,
+                "blocked": codes[0] if codes else 0,
                 # 汇总口径：p95 取最差域名（有域名卡就算不合格），
                 # p50 取平均（代表典型体感），样本数用于评估可信度
                 "p95": max(p95s) if p95s else float(FINAL_TIMEOUT_MS),
@@ -543,7 +620,12 @@ def run_domain_round(cands, domains, verbose=True):
     # 又不会把「p50 好看但时不时卡死」的 IP 选出来。
     kept, rejected = [], []
     for r in out:
-        if r["p95"] >= P95_REJECT_MS:
+        if r.get("blocked"):
+            # 比「慢」更糟：这个 IP 根本不服务目标域名，写进 hosts 就是错误页。
+            # 单列出来，避免和「时断时续」混在同一个淘汰池里。
+            r["p95_reject"] = True
+            rejected.append(r)
+        elif r["p95"] >= P95_REJECT_MS:
             r["p95_reject"] = True
             rejected.append(r)
         else:
@@ -551,10 +633,16 @@ def run_domain_round(cands, domains, verbose=True):
             kept.append(r)
 
     if verbose:
-        if rejected:
-            names = ", ".join(f"{r['ip']}(p95={r['p95']:.0f})" for r in rejected[:5])
-            print(f"  已淘汰 {len(rejected)} 个有硬超时的 IP：{names}"
-                  f"{'…' if len(rejected) > 5 else ''}", flush=True)
+        blocked_n = sum(1 for r in out if r.get("blocked"))
+        if blocked_n:
+            codes = sorted({r["blocked"] for r in out if r.get("blocked")})
+            print(f"  已剔除 {blocked_n} 个「不服务目标域名」的 IP"
+                  f"（HTTP {'/'.join(map(str, codes))}，多为 CF 1034）", flush=True)
+        slow = [r for r in rejected if not r.get("blocked")]
+        if slow:
+            names = ", ".join(f"{r['ip']}(p95={r['p95']:.0f})" for r in slow[:5])
+            print(f"  已淘汰 {len(slow)} 个有硬超时的 IP：{names}"
+                  f"{'…' if len(slow) > 5 else ''}", flush=True)
         if not kept:
             print(f"  [警告] 所有候选的 p95 都触到超时惩罚值，只能按 p95 兜底排序。",
                   flush=True)
@@ -568,7 +656,7 @@ def run_domain_round(cands, domains, verbose=True):
     kept.sort(key=key)
     # 被淘汰的按 p95 升序垫在后面：只在调用方凑不够数量时才会被取到，
     # 且此时它们是「最不坏的」那些，而不是随机挑。
-    rejected.sort(key=lambda r: (r["p95"], r["p50"]))
+    rejected.sort(key=lambda r: (bool(r.get("blocked")), r["p95"], r["p50"]))
     out = kept + rejected
 
     if verbose:
@@ -607,6 +695,13 @@ def scan_verified(domains, want, quick=True, full_probe=40, verbose=True,
             if len(chosen) >= want:
                 break
             tried.add(r["ip"])
+            # 不服务目标域名的 IP 一个都不能用——写进 hosts 就是错误页，
+            # 比慢更糟，所以连降级兜底的机会都不给。
+            if r.get("blocked"):
+                if verbose:
+                    print(f"    {r['ip']:<16}跳过  该 IP 返回 HTTP {r['blocked']}，"
+                          f"不服务目标域名")
+                continue
             # 近端机房优先；远端只在凑不够时补位（scan 已排好序）
             ip = r["ip"]
             bad = []
@@ -834,6 +929,9 @@ def cmd_scan(args):
         cells = []
         for r in best[:5]:
             v = (r.get("per_domain") or {}).get(d) or {}
+            if v.get("blocked"):
+                cells.append(f"{'HTTP ' + str(v['blocked']):>15}")
+                continue
             p = v.get("p95")
             if p is None:
                 cells.append(f"{'—':>15}")
@@ -852,6 +950,38 @@ def cmd_scan(args):
     return 0
 
 
+def http_probe(ip, domain, port=443, timeout=DOMAIN_TIMEOUT):
+    """一次完整 HTTPS 请求，返回 (状态码, 响应前 512 字节)。拿不到返回 (0, b"")。
+
+    存在的意义：证书校验只能证明「TLS 握手成功」，证明不了「这个 IP 服务
+    这个域名」。CF 会对不属于该 zone 的 IP 回 403 + error code 1034，
+    TLS 照样握手成功、证书照样对——只看证书就会把这种 IP 当健康 IP 写进
+    hosts，用户打开浏览器看到的是一张 Cloudflare 错误页。
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {domain}\r\n"
+           f"User-Agent: cf-pin\r\nConnection: close\r\n\r\n").encode()
+    try:
+        raw = socket.create_connection((ip, port), timeout=timeout)
+        with ctx.wrap_socket(raw, server_hostname=domain) as s:
+            s.settimeout(timeout)
+            s.sendall(req)
+            buf = b""
+            while len(buf) < 512:
+                chunk = s.recv(512)
+                if not chunk:
+                    break
+                buf += chunk
+    except (OSError, ssl.SSLError):
+        return 0, b""
+    if not buf.startswith(b"HTTP/"):
+        return 0, buf
+    st = buf.split(b" ", 2)[1] if b" " in buf else b""
+    return (int(st) if st.isdigit() else 0), buf
+
+
 def cmd_apply(args):
     domains = args.domains.split(",") if args.domains else DEFAULT_DOMAINS
     domains = [d.strip() for d in domains if d.strip()]
@@ -866,7 +996,7 @@ def cmd_apply(args):
         ips = [x.strip() for x in args.ip.split(",") if x.strip()]
         print(f"使用指定 IP：{', '.join(ips)}")
         print("\n" + "=" * 74)
-        print("第 2 步：写入前的安全校验（逐个域名校验证书）")
+        print("第 2 步：写入前的安全校验（逐域名校验证书 + HTTP 状态）")
         print("=" * 74)
         safe = []
         for ip in ips:
@@ -875,13 +1005,23 @@ def cmd_apply(args):
                 ok, msg = cert_ok(ip, d)
                 if not ok:
                     bad.append(f"{d}: {msg}")
+                    continue
+                # 证书过了不代表能用：CF 对不归属该 zone 的 IP 会回
+                # 403 + code 1034，TLS 握手和证书都是正常的。
+                code, body = http_probe(ip, d)
+                if code >= 500:
+                    bad.append(f"{d}: HTTP {code}（该 IP 服务异常）")
+                elif code == 403 and b"1034" in body:
+                    bad.append(f"{d}: HTTP 403 / CF 1034"
+                               f"（该 IP 不服务这个域名）")
             if bad:
                 print(f"  {ip:<16}不通过  " + "; ".join(bad))
             else:
                 print(f"  {ip:<16}通过    {len(domains)} 个域名的证书校验全部通过")
                 safe.append(ip)
         if not safe:
-            print("\n[X] 候选 IP 都没通过证书校验，为安全起见不写入 hosts。")
+            print("\n[X] 候选 IP 都没通过安全校验，为安全起见不写入 hosts。")
+            print("    证书通过但回 403/1034 的 IP，写进 hosts 只会打开一张错误页。")
             return 1
     else:
         print("=" * 74)
@@ -1003,6 +1143,21 @@ def cmd_status(args):
     return 0
 
 
+def cmd_ranges(args):
+    """查看 / 更新网段列表（走 Cloudflare 官方免费接口，不需要 token）。"""
+    if args.refresh:
+        print("  正在从 Cloudflare 官方接口拉取最新网段…", flush=True)
+    ps, src = load_ranges(refresh=args.refresh)
+    print(f"\n  网段来源：{src}（共 {len(ps)} 个 IPv4 段）\n")
+    prio = {c for c, _ in PRIORITY_RANGES}
+    for c in ps:
+        print(f"    {c}" + ("  ← 目前默认优先扫这段" if c in prio else ""))
+    print()
+    if not args.refresh:
+        print("  想更新：python cf_pin.py ranges --refresh\n")
+    return 0
+
+
 def cmd_menu(args):
     while True:
         print()
@@ -1077,6 +1232,11 @@ def main(argv=None):
     p = sub.add_parser("status", help="查看当前状态")
     p.add_argument("--hosts-file", help="（自测用）读副本文件")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("ranges", help="查看/更新 Cloudflare 官方网段（免费接口）")
+    p.add_argument("--refresh", action="store_true",
+                   help="联网拉取最新网段并缓存到本地")
+    p.set_defaults(func=cmd_ranges)
 
     p = sub.add_parser("menu", help="交互式菜单")
     p.set_defaults(func=cmd_menu)
