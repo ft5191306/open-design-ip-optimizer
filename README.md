@@ -66,6 +66,7 @@ python cf_pin.py scan      # 只扫描不改动系统
 python cf_pin.py apply     # 扫描并写入 hosts（需管理员）
 python cf_pin.py status    # 查看当前状态与实测延迟
 python cf_pin.py revert    # 删除写入的段，恢复原样
+python cf_pin.py ranges    # 查看/更新 Cloudflare 官方网段（免费接口）
 ```
 
 常用参数：
@@ -76,7 +77,12 @@ python cf_pin.py apply --ip 162.159.129.1        # 指定 IP，跳过扫描
 python cf_pin.py apply --domains open-design.ai  # 指定域名
 python cf_pin.py apply --redundant 3             # 写几个备用 IP
 python cf_pin.py apply --dry-run                 # 演练，不实际写入
+python cf_pin.py ranges --refresh                # 联网拉取最新网段并缓存
 ```
+
+内置的网段列表是一份快照，Cloudflare 迟早会调整。`ranges --refresh` 走的是官方
+免费接口 `api.cloudflare.com/client/v4/ips`（不需要 token），拉到之后存本地，
+之后的扫描优先用它，拉不到就安静回退到内置列表，不会因此跑不起来。
 
 ## 候选池：为什么默认只扫两段
 
@@ -94,6 +100,22 @@ python cf_pin.py apply --dry-run                 # 演练，不实际写入
 `--full` 保留全量扫描作为逃生通道：链路状况变了、或关键段被阻断时仍有兜底。
 
 抽样用等距而非随机：实测两者在统计上无法区分（近端 11~12 个，随机 8 个种子均值 11.75），但随机会让每次 scan 结果不可复现、出问题难排查。
+
+## 会回 403 的 IP 现在会被淘汰
+
+Cloudflare 对不属于某个 zone 的 anycast IP 会回 `403` + `error code: 1034`，
+但 **TLS 握手和证书都是正常的**。只看「连不连得上」的话，这种 IP 的响应
+往往只要 300~400ms，看着非常健康 —— 写进 hosts 之后，浏览器里是一张错误页。
+
+现在有两道判定：
+
+- 测量轮里收到 4xx/5xx 的样本按失败计（记 999ms），结果表里直接标成
+  `HTTP 403` 而不是一个漂亮的延迟数字。这种 IP 一律淘汰，连「凑不够时补位」
+  的兜底机会都不给。
+- `apply --ip <IP>` 手动指定时，除了校验证书，还会实际请求一次
+  `/cdn-cgi/trace`；命中 403/1034 就不写 hosts，并说明原因。
+
+跑 scan 时看到 `已剔除 N 个「不服务目标域名」的 IP` 就是这一条在起作用。
 
 ## 关于延迟，需要说清楚一点
 
