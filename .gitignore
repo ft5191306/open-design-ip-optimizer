@@ -7,6 +7,11 @@ __pycache__/
 cf_choice.json
 *.bak.*
 hosts.bak.*
+cfpin.log
+bat/cfpin.log
+bat/data/state.json
+bat/data/*.bak
+bat/data/hosts-test*
 
 # 测试数据（仅供参考，不随仓库分发）
 *_results.json

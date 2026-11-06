@@ -1,0 +1,13 @@
+{
+  "autoWrite": true,
+  "currentProbeMs": 3000,
+  "candidateConcurrency": 1,
+  "switchThresholdMs": 150,
+  "addresses": [
+    "amr-link.open-design.ai"
+  ],
+  "writeAddresses": [
+    "amr-link.open-design.ai",
+    "open-design.ai"
+  ]
+}

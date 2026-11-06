@@ -54,11 +54,11 @@ Cloudflare 用 anycast 分配机房，同一个域名在不同线路上会落到
 
 ## 用法
 
-### 一键（推荐）
+仓库里有两套实现，测量口径与 hosts 标记段完全一致，选一个用即可，**不要同时跑**。
 
-双击 `open-design优选IP.bat`，会自动申请管理员权限，然后扫描、校验、写入。
+### A. Python 脚本 `cf_pin.py`（需要 Python 3.8+）
 
-### 命令行
+一键：双击 `open-design优选IP.bat`，会自动申请管理员权限，然后扫描、校验、写入。
 
 ```bash
 python cf_pin.py menu      # 交互式菜单
@@ -77,6 +77,19 @@ python cf_pin.py apply --domains open-design.ai  # 指定域名
 python cf_pin.py apply --redundant 3             # 写几个备用 IP
 python cf_pin.py apply --dry-run                 # 演练，不实际写入
 ```
+
+### B. PowerShell 内核 `bat/`（不需要任何运行时依赖）
+
+Windows 自带的 PowerShell 5.1 直接跑，不用装 Python。双击 `bat/cfpin.bat`，
+三个选项：
+
+1. **执行一次测速并展示结果** —— 只测、只显示，不改 hosts
+2. **测速并自动写入 hosts** —— 测完写最优的 1~2 个（写前做证书校验）
+3. **常驻检测和切换** —— 当前线路 3 秒采样、候选 5 分钟一轮，快 150ms 就自动换
+
+第 3 项是 `cf_pin.py` 没有的形态：它常驻在后台持续判断「当前这条线是不是变慢了」，
+而不是每次手动重扫一遍。默认档：3 秒采样 / 候选并发 1 / 阈值 150ms / 轮间隔 5 分钟。
+详见 [bat/README.md](bat/README.md)。
 
 ## 候选池：为什么默认只扫两段
 
@@ -123,4 +136,7 @@ python cf_pin.py apply --dry-run                 # 演练，不实际写入
 
 ## 环境
 
-Windows（改写 hosts 需要管理员权限），Python 3.8+，无第三方依赖。
+Windows（改写 hosts 需要管理员权限）。
+
+- `cf_pin.py`：Python 3.8+，无第三方依赖
+- `bat/`：Windows 自带的 PowerShell 5.1（`Add-Type` 编译内嵌的 C# 网络原语），无第三方依赖
