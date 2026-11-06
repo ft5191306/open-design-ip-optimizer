@@ -889,7 +889,9 @@ function ConvertFrom-CfProbeLine {
     $colo = if ($Fields.Count -gt 6) { $Fields[6] } else { '' }
     $edge = ($Fields.Count -gt 7 -and $Fields[7] -eq '1')
     $broken = (($timeouts -ge 3) -or ($loss -ge $script:FLAKY_LOSS_PCT))
-    $tier = if ($broken) { 'degraded' } elseif ($retries -gt 0) { 'ok' } elseif ($timeouts -eq 0 -and $loss -eq 0) { 'clean' } else { 'ok' }
+    # edge = 该边缘回 4xx/5xx（典型 403 + error code 1034）：不服务该 zone，
+    # 「延迟」没有意义，单独一层 blocked，永不写 hosts。
+    $tier = if ($edge) { 'blocked' } elseif ($broken) { 'degraded' } elseif ($retries -gt 0) { 'ok' } elseif ($timeouts -eq 0 -and $loss -eq 0) { 'clean' } else { 'ok' }
     return [pscustomobject]@{
         ip = $Ip
         p50 = $p50
@@ -915,7 +917,7 @@ function Invoke-CfProbeOne {
 function Sort-CfCandidates {
     param($List)
     return @($List | Sort-Object -Property `
-        @{ Expression = { if ($_.tier -eq 'degraded') { 1 } else { 0 } } }, `
+        @{ Expression = { if ($_.tier -eq 'blocked') { 2 } elseif ($_.tier -eq 'degraded') { 1 } else { 0 } } }, `
         @{ Expression = { if ($null -eq $_.p50) { $script:PENALTY_MS } else { $_.p50 } } }, `
         @{ Expression = { $_.loss } }, `
         @{ Expression = { $_.p95 } })
@@ -927,6 +929,7 @@ function Get-CfTierName {
         'clean'    { return '健康' }
         'ok'       { return '可用' }
         'degraded' { return '丢包' }
+        'blocked'  { return '不服务' }
         default    { return $Tier }
     }
 }
@@ -1066,7 +1069,10 @@ function Invoke-CfScan {
         foreach ($r in $per) { $samples += $r.samples; $timeouts += $r.timeouts; $retries += $r.connRetries }
         $loss = if ($samples -gt 0) { 100.0 * $timeouts / $samples } else { 100 }
         $broken = (($timeouts -ge 3) -or ($loss -ge $script:FLAKY_LOSS_PCT))
-        $tier = if ($broken) { 'degraded' } elseif ($retries -gt 0) { 'ok' } elseif ($timeouts -eq 0 -and $loss -eq 0) { 'clean' } else { 'ok' }
+        # edgeRefused：任一域名回 4xx/5xx（典型 403 + error code 1034）——该
+        # 边缘不服务这个 zone。这类 IP 绝不写 hosts，也不参与切换判定。
+        $edgeRefused = @($per | Where-Object { $_.edgeRefused }).Count -gt 0
+        $tier = if ($edgeRefused) { 'blocked' } elseif ($broken) { 'degraded' } elseif ($retries -gt 0) { 'ok' } elseif ($timeouts -eq 0 -and $loss -eq 0) { 'clean' } else { 'ok' }
         $measured += [pscustomobject]@{
             ip = $ip
             colo = if ($coloOf.ContainsKey($ip)) { $coloOf[$ip] } else { '' }
@@ -1077,6 +1083,7 @@ function Invoke-CfScan {
             timeouts = $timeouts
             connRetries = $retries
             broken = $broken
+            edgeRefused = $edgeRefused
             tier = $tier
         }
     }
@@ -1120,7 +1127,14 @@ function Get-CfDecision {
     if ($null -eq $Current -or $null -eq $Current.p50) { return @{ write = $false; reason = 'cold-start' } }
     if ($null -eq $Candidates -or @($Candidates).Count -eq 0) { return @{ write = $false; reason = 'no-candidate' } }
 
-    $healthy = @($Candidates | Where-Object { $CertFailedIps -notcontains $_.ip })
+    # 排除证书/zone 不适配的候选：
+    #   - CertFailedIps：证书链或主机名校验没过的（缓存 1 小时）
+    #   - edgeRefused：CF 回 4xx/5xx（典型 403 + error code 1034）表示这个
+    #     边缘根本不服务该 zone，TLS/证书正常、延迟还好看，写进 hosts 就是
+    #     错误页，所以永远不参与判定
+    $healthy = @($Candidates | Where-Object {
+        $CertFailedIps -notcontains $_.ip -and -not $_.edgeRefused
+    })
     if ($healthy.Count -eq 0) { return @{ write = $false; reason = 'no-candidate' } }
     $usable = @($healthy | Where-Object { -not $_.broken })
     $degraded = ($usable.Count -eq 0)
@@ -1185,12 +1199,16 @@ function Invoke-CfApply {
     }
     if ($null -eq $WriteDomains -or $WriteDomains.Count -eq 0) { $WriteDomains = $Addresses }
     $now = Get-Date
+    # edgeRefused = CF 回 4xx/5xx（典型 403 + error code 1034）：该边缘不服务
+    # 这个 zone，TLS/证书正常、延迟好看，但写进 hosts 打开就是错误页。
+    # 这里直接排除，连「全部偏慢时降级写」的兜底机会都不给。
     $healthy = @($Candidates | Where-Object {
+        if ($_.edgeRefused) { return $false }
         $at = $CertFailures[$_.ip]
         if ($null -eq $at) { $true } elseif (($now - $at).TotalHours -gt 1) { $CertFailures.Remove($_.ip); $true } else { $false }
     })
     if ($healthy.Count -eq 0) {
-        return @{ ok = $false; reason = '候选在证书校验上均已被判为不适配，已记下并暂时跳过' }
+        return @{ ok = $false; reason = '候选都不服务目标域名（证书不适配或 CF 返回 4xx/5xx），已全部跳过' }
     }
     $usable = @($healthy | Where-Object { -not $_.broken })
     $chosen = @($usable | Select-Object -First $script:MAX_WRITE_IPS)

@@ -254,6 +254,30 @@ def tls_trace(ip, sni=SNI_FALLBACK, timeout=6.0):
     return info
 
 
+# CF 对「不属于该 zone 的 anycast IP」会回 403 + `error code: 1034`，但 TLS
+# 握手和证书都正常、响应还很快。这种 IP 写进 hosts 就是一张错误页，所以：
+#   - 测量轮里 >=400 的响应一律按失败样本处理，并标记 blocked 淘汰
+#   - 写前闸门额外请求 /cdn-cgi/trace，403 / 1034 直接拒写
+HTTP_BAD_STATUS = 400
+
+
+def http_status(head):
+    """从 HTTP 响应首行解析状态码；拿不到返回 0。"""
+    m = re.match(rb"HTTP/1\.[01]\s+(\d{3})", head)
+    return int(m.group(1)) if m else 0
+
+
+def cf_edge_error(body):
+    """响应里是否带 Cloudflare 的 `error code: NNNN`；没有返回 0。
+
+    1034 = 该边缘不服务这个 zone（CNAME Cross-User Banned 类），
+    1001 / 1000 等同理。只要出现就不该把这个 IP 写进 hosts —— TLS 和
+    证书都正常，用户打开却是一张错误页。
+    """
+    m = re.search(rb"error code:\s*(\d{4})", body, re.I)
+    return int(m.group(1)) if m else 0
+
+
 def domain_p95(ip, domain, port=443, window_s=FINAL_WINDOW_S,
                interval_s=FINAL_INTERVAL_S, timeout=DOMAIN_TIMEOUT,
                penalty_ms=FINAL_TIMEOUT_MS):
@@ -270,6 +294,9 @@ def domain_p95(ip, domain, port=443, window_s=FINAL_WINDOW_S,
 
     不做证书校验（只为测速，不用于写 hosts 的安全判定）。
     超时样本按 penalty_ms 计入统计，参与 p95 计算。
+
+    4xx/5xx 不是「慢」，而是「这个 IP 不服务这个域名」：命中后记一个
+    惩罚样本、给 blocked 打上状态码并立刻收工，不进推荐池。
     """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -277,7 +304,7 @@ def domain_p95(ip, domain, port=443, window_s=FINAL_WINDOW_S,
     req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {domain}\r\n"
            "User-Agent: cf-pin\r\nConnection: close\r\n\r\n").encode()
 
-    samples, timeouts, colo = [], 0, None
+    samples, timeouts, colo, blocked = [], 0, None, 0
     deadline = time.perf_counter() + window_s
 
     while time.perf_counter() < deadline:
@@ -290,6 +317,12 @@ def domain_p95(ip, domain, port=443, window_s=FINAL_WINDOW_S,
                 head = s.recv(1024)                # 首字节到达即停，不读完整个响应
                 if not head:
                     raise OSError("empty response")
+                status = http_status(head)
+                code = cf_edge_error(head)
+                if status >= HTTP_BAD_STATUS or code:
+                    # CF 不服务该 zone：状态码不是「慢」的证据，直接判死。
+                    blocked = status or 403
+                    raise OSError(f"http {status} / cf {code}")
             samples.append((time.perf_counter() - t0) * 1000)
             if colo is None:
                 m = re.search(rb"^colo=(\S+)$", head, re.M)
@@ -298,6 +331,8 @@ def domain_p95(ip, domain, port=443, window_s=FINAL_WINDOW_S,
         except OSError:
             timeouts += 1
             samples.append(float(penalty_ms))
+            if blocked:                            # 状态码错一次就够，别空转满窗口
+                break
         except ssl.SSLError:
             timeouts += 1
             samples.append(float(penalty_ms))
@@ -308,12 +343,14 @@ def domain_p95(ip, domain, port=443, window_s=FINAL_WINDOW_S,
 
     if not samples:
         return {"domain": domain, "colo": colo, "n": 0, "p50": None,
-                "p95": float(penalty_ms), "loss": 100.0, "timeouts": 0}
+                "p95": float(penalty_ms), "loss": 100.0, "timeouts": 0,
+                "blocked": blocked}
     samples.sort()
     return {
         "domain": domain,
         "colo": colo,
         "n": len(samples),
+        "blocked": blocked,
         "p50": round(percentile(samples, 0.50), 1),
         "p95": round(percentile(samples, 0.95), 1),
         "loss": round(100.0 * timeouts / len(samples), 1),
@@ -336,12 +373,12 @@ def probe_domains(ip, domains, workers=8):
 
 
 def cert_ok(ip, domain, timeout=8.0):
-    """写入 hosts 前的安全闸门：用真实证书校验连一次。
+    """写入 hosts 前的第一道闸门：用真实证书校验连一次。
 
     判定标准是「证书链 + 主机名校验通过」——`wrap_socket` 能完成握手，
-    就证明这个 IP 确实持有该域名的合法证书。
-    HTTP 状态码只作参考，不参与判定：API 子域（如 amr-link.open-design.ai）
-    根路径返回 404 是正常行为，不能据此认为该 IP 不可信。"""
+    就证明这个 IP 确实持有该域名的合法证书。它**不能**证明这个 IP 真的
+    为该 zone 服务（CF 边缘全网都能出示同一张证书），所以写入前还要再过
+    `http_probe()`。"""
     ctx = ssl.create_default_context()             # 开启校验
     try:
         raw = socket.create_connection((ip, 443), timeout=timeout)
@@ -355,6 +392,38 @@ def cert_ok(ip, domain, timeout=8.0):
         return False, str(exc)[:80]
     m = re.match(r"HTTP/1\.[01] (\d{3})", head)
     return True, f"证书校验通过 · HTTP {m.group(1) if m else '?'}"
+
+
+def http_probe(ip, domain, port=443, timeout=8.0, attempts=2):
+    """第二道闸门：确认这个 IP 真的在为该 zone 服务。
+
+    返回 (状态码, 响应前 4KB)。拿不到返回 (0, b"")。
+
+    为什么必须单独做一次：CF 对不属于该 zone 的 anycast IP 会回
+    `403 + error code: 1034`，TLS 握手和证书都正常、响应甚至更快。
+    只看证书就会把这种 IP 当健康 IP 写进 hosts，用户打开是错误页。
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {domain}\r\n"
+           "User-Agent: cf-pin\r\nConnection: close\r\n\r\n").encode()
+    for _ in range(max(1, attempts)):
+        try:
+            raw = socket.create_connection((ip, port), timeout=timeout)
+            with ctx.wrap_socket(raw, server_hostname=domain) as s:
+                s.settimeout(timeout)
+                s.sendall(req)
+                buf = b""
+                while len(buf) < 4096:
+                    chunk = s.recv(1024)
+                    if not chunk:
+                        break
+                    buf += chunk
+        except (OSError, ssl.SSLError):
+            continue
+        return http_status(buf), buf
+    return 0, b""
 
 
 def throughput(ip, kib=1024, timeout=15.0):
@@ -537,8 +606,12 @@ def run_domain_round(cands, domains, verbose=True):
         p50s = [v["p50"] for v in per.values() if v["p50"] is not None]
         n_total = sum(v["n"] for v in per.values())
         to_total = sum(v["timeouts"] for v in per.values())
+        # 只要有一个域名回 4xx/5xx（典型是 CF 的 403 + 1034），这个 IP 对
+        # 用户就是不可用的：TLS/证书都正常、延迟还好看，打开却是错误页。
+        codes = [v.get("blocked") for v in per.values() if v.get("blocked")]
         return {**r,
                 "per_domain": per,
+                "blocked": codes[0] if codes else 0,
                 # 汇总口径：p95 取最差域名（有域名卡就算不合格），
                 # p50 取平均（代表典型体感），样本数用于评估可信度
                 "p95": max(p95s) if p95s else float(FINAL_TIMEOUT_MS),
@@ -554,9 +627,15 @@ def run_domain_round(cands, domains, verbose=True):
     # 判定用「最差域名的 p95」，因为只要有一个域名卡，用户在访问它时就会遇到。
     # 这一步必须在排序之前——先淘汰再按 p50 排，才能既不被抖动带跑、
     # 又不会把「p50 好看但时不时卡死」的 IP 选出来。
+    #
+    # blocked（4xx/5xx）单独一档：那不是「慢」，是这个 IP 根本不服务该域名，
+    # 连「凑不够时降级使用」的机会都不给。
     kept, rejected = [], []
     for r in out:
-        if r["p95"] >= P95_REJECT_MS:
+        if r.get("blocked"):
+            r["p95_reject"] = True
+            rejected.append(r)
+        elif r["p95"] >= P95_REJECT_MS:
             r["p95_reject"] = True
             rejected.append(r)
         else:
@@ -564,10 +643,18 @@ def run_domain_round(cands, domains, verbose=True):
             kept.append(r)
 
     if verbose:
-        if rejected:
-            names = ", ".join(f"{r['ip']}(p95={r['p95']:.0f})" for r in rejected[:5])
-            print(f"  已淘汰 {len(rejected)} 个有硬超时的 IP：{names}"
-                  f"{'…' if len(rejected) > 5 else ''}", flush=True)
+        blocked = [r for r in out if r.get("blocked")]
+        if blocked:
+            codes = sorted({r["blocked"] for r in blocked})
+            print(f"  已剔除 {len(blocked)} 个「不服务目标域名」的 IP"
+                  f"（HTTP {'/'.join(map(str, codes))}，多为 CF 1034）："
+                  f"{', '.join(r['ip'] for r in blocked[:5])}"
+                  f"{'…' if len(blocked) > 5 else ''}", flush=True)
+        slow = [r for r in rejected if not r.get("blocked")]
+        if slow:
+            names = ", ".join(f"{r['ip']}(p95={r['p95']:.0f})" for r in slow[:5])
+            print(f"  已淘汰 {len(slow)} 个有硬超时的 IP：{names}"
+                  f"{'…' if len(slow) > 5 else ''}", flush=True)
         if not kept:
             print(f"  [警告] 所有候选的 p95 都触到超时惩罚值，只能按 p95 兜底排序。",
                   flush=True)
@@ -579,9 +666,9 @@ def run_domain_round(cands, domains, verbose=True):
         return (r["p50"], r["p95"])
 
     kept.sort(key=key)
-    # 被淘汰的按 p95 升序垫在后面：只在调用方凑不够数量时才会被取到，
-    # 且此时它们是「最不坏的」那些，而不是随机挑。
-    rejected.sort(key=lambda r: (r["p95"], r["p50"]))
+    # 被淘汰的按 blocked → p95 升序垫在后面：只在调用方凑不够数量时才会被
+    # 取到；blocked 的永远排在最后（scan_verified 也不会取它）。
+    rejected.sort(key=lambda r: (bool(r.get("blocked")), r["p95"], r["p50"]))
     out = kept + rejected
 
     if verbose:
@@ -622,6 +709,13 @@ def scan_verified(domains, want, quick=True, full_probe=40, verbose=True,
             tried.add(r["ip"])
             # 近端机房优先；远端只在凑不够时补位（scan 已排好序）
             ip = r["ip"]
+            # 不服务目标域名的 IP 一个都不能用：写进 hosts 就是错误页，
+            # 比慢更糟，所以连降级兜底的机会都不给。
+            if r.get("blocked"):
+                if verbose:
+                    print(f"    {ip:<16}跳过  该 IP 返回 HTTP {r['blocked']}"
+                          f"（多为 CF 1034），不服务目标域名")
+                continue
             bad = []
             for d in domains:
                 ok, msg = cert_ok(ip, d)
@@ -935,6 +1029,11 @@ def cmd_scan(args):
     print("  " + "-" * 74)
     for r in best:
         per = r.get("per_domain") or {}
+        if r.get("blocked"):
+            # 这类 IP 的「延迟」没有意义：它根本没为这个域名服务。
+            print(f"  {r['ip']:<16}{str(r.get('colo')):<6}{'—':>9}{'—':>9}"
+                  f"{'—':>8}{'—':>12}   HTTP {r['blocked']}（不服务该域名，已排除）")
+            continue
         p95s = [v["p95"] for v in per.values() if v["p95"] is not None]
         worst = max(p95s) if p95s else None
         n = r.get("n") or 0
@@ -956,6 +1055,10 @@ def cmd_scan(args):
         cells = []
         for r in best[:5]:
             v = (r.get("per_domain") or {}).get(d) or {}
+            if v.get("blocked"):
+                # 4xx/5xx 不是延迟数值：直接标出状态码，别让用户误以为它「快」。
+                cells.append(f"{'HTTP ' + str(v['blocked']):>15}")
+                continue
             p = v.get("p95")
             if p is None:
                 cells.append(f"{'—':>15}")
@@ -988,7 +1091,7 @@ def cmd_apply(args):
         ips = [x.strip() for x in args.ip.split(",") if x.strip()]
         print(f"使用指定 IP：{', '.join(ips)}")
         print("\n" + "=" * 74)
-        print("第 2 步：写入前的安全校验（逐个域名校验证书）")
+        print("第 2 步：写入前的安全校验（逐域名校验证书 + 确认该 IP 服务该域名）")
         print("=" * 74)
         safe = []
         for ip in ips:
@@ -997,13 +1100,26 @@ def cmd_apply(args):
                 ok, msg = cert_ok(ip, d)
                 if not ok:
                     bad.append(f"{d}: {msg}")
+                    continue
+                # 证书过了不代表能用：CF 对不归属该 zone 的 anycast IP 会回
+                # 403 + error code 1034，TLS 和证书都是正常的。
+                status, body = http_probe(ip, d)
+                code = cf_edge_error(body)
+                if code:
+                    bad.append(f"{d}: HTTP {status or '?'} / CF {code}"
+                               f"（该 IP 不服务这个域名）")
+                elif status >= HTTP_BAD_STATUS:
+                    bad.append(f"{d}: HTTP {status}（该 IP 不服务这个域名）")
+                elif status == 0:
+                    bad.append(f"{d}: 无法确认该 IP 服务此域名（响应为空/超时）")
             if bad:
                 print(f"  {ip:<16}不通过  " + "; ".join(bad))
             else:
-                print(f"  {ip:<16}通过    {len(domains)} 个域名的证书校验全部通过")
+                print(f"  {ip:<16}通过    {len(domains)} 个域名的证书与链路校验全部通过")
                 safe.append(ip)
         if not safe:
-            print("\n[X] 候选 IP 都没通过证书校验，为安全起见不写入 hosts。")
+            print("\n[X] 候选 IP 都没通过安全校验，为安全起见不写入 hosts。")
+            print("    证书通过但回 403/1034 的 IP，写进 hosts 只会打开一张错误页。")
             return 1
     else:
         print("=" * 74)

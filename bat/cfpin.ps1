@@ -164,10 +164,16 @@ function Invoke-CfActionScan {
 
     # 「如果写会写什么」
     $writeDomains = Get-CfWriteDomains $cfg
-    $usable = @($scan.candidates | Where-Object { -not $_.broken } | Select-Object -First $script:MAX_WRITE_IPS)
+    # 排除 edgeRefused（403/1034 等「不服务该域名」）与 broken（丢包）的候选
+    $fit = @($scan.candidates | Where-Object { -not $_.edgeRefused })
+    $usable = @($fit | Where-Object { -not $_.broken } | Select-Object -First $script:MAX_WRITE_IPS)
     if ($usable.Count -eq 0) {
-        $usable = @($scan.candidates | Select-Object -First $script:MAX_WRITE_IPS)
-        Write-Host ('  没有任何不丢包的候选，若写入会降级写：' + (($usable | ForEach-Object { $_.ip }) -join '、')) -ForegroundColor Yellow
+        $usable = @($fit | Select-Object -First $script:MAX_WRITE_IPS)
+        if ($usable.Count -gt 0) {
+            Write-Host ('  没有任何不丢包的候选，若写入会降级写：' + (($usable | ForEach-Object { $_.ip }) -join '、')) -ForegroundColor Yellow
+        } else {
+            Write-Host '  没有服务目标域名的候选（403/1034 已全部排除），写 hosts 会拒绝执行。' -ForegroundColor Yellow
+        }
     } else {
         Write-Host ('  若写入，会写：' + (($usable | ForEach-Object { $_.ip }) -join '、')) -ForegroundColor DarkGray
     }
