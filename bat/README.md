@@ -1,4 +1,4 @@
-﻿# cfhk 优选线路 · bat 版（PowerShell 内核）
+# cfhk 优选线路 · bat 版（PowerShell 内核）
 
 把 `cf_pin.py` 的测量口径与判定规则搬到 Windows 自带的 PowerShell 上，
 做成双击即用的三选项工具。**不需要 Python、不需要 Node、不需要装任何东西。**
@@ -31,7 +31,12 @@
 同上测一遍，写前对**探测域名**逐个候选做**真实证书链 + 主机名校验**（还会确认这个
 边缘真的在为该 zone 服务，避免 `error code: 1034` 那种「证书正常但拒绝服务」的
 IP 被写进去）。通过校验的按优劣写 1~2 个到 hosts 的 `CLOUDFLARE-PIN` 标记段，
-备份到 `hosts.bak`，写完刷新 DNS。
+写完刷新 DNS。
+
+备份只在**第一次改写 hosts 之前**做一次（复制为 `hosts.bak`），之后不再覆盖；
+hosts 的编码也保持原样（GBK/ANSI、UTF-8 含 BOM、UTF-16 都能逐字节写回）。
+如果 hosts 里的标记段不完整（BEGIN/END 不成对），写入会直接失败并提示先手工修复，
+不会连带删掉标记段之后的条目。
 
 写入的域名是「探测地址 ∪ `writeAddresses`」：`open-design.ai` 这类**只写不测**的
 域名不参与测速（少一份噪声、不拖慢一轮），但会和探测域名用**同一个 IP**写进标记段。

@@ -27,8 +27,10 @@ Cloudflare 优选 IP 工具
 from __future__ import annotations
 
 import argparse
+import codecs
 import ipaddress
 import json
+import locale
 import os
 import re
 import shutil
@@ -49,6 +51,17 @@ DEFAULT_DOMAINS = ["cloudflare.com", "www.cloudflare.com",
 
 # 仅用于自测：把 hosts 操作指向副本，避免动到系统文件
 HOSTS_OVERRIDE = None
+
+# hosts 的编码/BOM：read_hosts() 探测后记在这里，write_hosts() 沿用同一组。
+# 中文 Windows 上的 hosts 常被存成 ANSI/GBK 甚至 UTF-16，用 UTF-8 强读强写
+# 会把中文注释永久替换成 U+FFFD（无法还原），所以必须保持原编码。
+HOSTS_ENCODING = "utf-8"
+HOSTS_PREAMBLE = b""
+
+# 备份只在「第一次由本工具改写 hosts 之前」创建一次，之后永不覆盖。
+# 固定文件名，便于用户找到；已存在就跳过，避免把真正的原始文件顶掉。
+BACKUP_SUFFIX = ".bak"
+
 
 CF_RANGES_V4 = [
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
@@ -649,18 +662,96 @@ def hosts_path():
     return "/etc/hosts"
 
 
+class BrokenBlockError(RuntimeError):
+    """hosts 里的 CLOUDFLARE-PIN 标记段不完整（BEGIN/END 不成对）。"""
+
+
+def _system_ansi_encoding():
+    """当前系统的 ANSI 代码页（中文 Windows 通常是 cp936），拿不到返回 None。"""
+    try:
+        enc = locale.getpreferredencoding(False)
+    except Exception:                              # noqa: BLE001
+        return None
+    return enc or None
+
+
+def _decode_hosts(raw):
+    """把 hosts 原始字节解成文本，并记住编码/BOM 供写回时原样还原。
+
+    顺序：BOM（UTF-8 / UTF-16 LE / UTF-16 BE）→ 严格 UTF-8 → 系统 ANSI
+    （cp936 等）→ latin-1。latin-1 对任意字节都能严格往返，所以即使文件里
+    混了未知字节，最坏情况也只是显示成乱码，写回仍然逐字节一致。
+    """
+    global HOSTS_ENCODING, HOSTS_PREAMBLE
+    for bom, enc in ((codecs.BOM_UTF8, "utf-8"),
+                     (codecs.BOM_UTF16_LE, "utf-16-le"),
+                     (codecs.BOM_UTF16_BE, "utf-16-be")):
+        if raw.startswith(bom):
+            HOSTS_ENCODING, HOSTS_PREAMBLE = enc, bom
+            return raw[len(bom):].decode(enc)
+    for enc in ("utf-8", _system_ansi_encoding(), "latin-1"):
+        if not enc:
+            continue
+        try:
+            text = raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        HOSTS_ENCODING, HOSTS_PREAMBLE = enc, b""
+        return text
+    HOSTS_ENCODING, HOSTS_PREAMBLE = "utf-8", b""
+    return raw.decode("utf-8", "surrogateescape")
+
+
+def encode_hosts(text):
+    """按最近一次 read_hosts() 探测到的编码把文本编码回字节（含 BOM）。"""
+    try:
+        body = text.encode(HOSTS_ENCODING)
+    except (UnicodeEncodeError, LookupError):
+        # 理论上不会走到；留 surrogateescape 兜底，保证能写回而不丢内容。
+        body = text.encode(HOSTS_ENCODING, "surrogateescape")
+    return HOSTS_PREAMBLE + body
+
+
 def read_hosts():
     path = hosts_path()
-    # newline="" 保留原始换行符（Windows hosts 是 CRLF），确保能逐字节还原
-    with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
-        return fh.read()
+    with open(path, "rb") as fh:
+        return _decode_hosts(fh.read())
 
 
 def detect_eol(text):
     return "\r\n" if "\r\n" in text else "\n"
 
 
-def strip_block(text):
+def block_state(text):
+    """标记段状态："none"（没有）/ "ok"（成对）/ "broken"（不配对）。
+
+    "broken" 包括：只有 BEGIN 没有 END、END 出现在 BEGIN 之前、BEGIN 嵌套。
+    这种情况下去删标记段会把 BEGIN 之后的全部内容一起删掉（包括用户自己的
+    条目），所以调用方必须 fail-closed，不能「尽力而为」。
+    """
+    inside, pairs = False, 0
+    for line in text.splitlines():
+        s = line.strip()
+        if s == BEGIN_MARK:
+            if inside:
+                return "broken"
+            inside = True
+        elif s == END_MARK:
+            if not inside:
+                return "broken"
+            inside = False
+            pairs += 1
+    if inside:
+        return "broken"
+    return "ok" if pairs else "none"
+
+
+def strip_block(text, force=False):
+    state = block_state(text)
+    if state == "broken" and not force:
+        raise BrokenBlockError(
+            "hosts 里的 CLOUDFLARE-PIN 标记段不完整（BEGIN/END 不成对）："
+            "继续删除会把标记段之后的条目一起删掉，已中止")
     out, skipping = [], False
     for line in text.splitlines(keepends=True):
         if line.strip() == BEGIN_MARK:
@@ -672,6 +763,20 @@ def strip_block(text):
         if not skipping:
             out.append(line)
     return "".join(out)
+
+
+def backup_path(path=None):
+    return (path or hosts_path()) + BACKUP_SUFFIX
+
+
+def backup_hosts_once(path=None):
+    """只在备份还不存在时创建（即「首次运行」）。返回 (备份路径, 是否新建)。"""
+    path = path or hosts_path()
+    bak = backup_path(path)
+    if os.path.exists(bak):
+        return bak, False
+    shutil.copy2(path, bak)
+    return bak, True
 
 
 def render_block(ips, domains, eol="\r\n"):
@@ -713,17 +818,32 @@ def write_hosts(new_text, path=None, backup=True):
     PermissionError 误报成「权限不足」，目录其实一点没毛病。
 
     所以这里先带退避重试原子替换（通常第 2 次就过），仍不行才退化成原地
-    重写。两级都失败才向上抛，绝不会留下半截文件（写之前已备份）。
+    重写。
+
+    备份策略：只在「备份文件还不存在」时创建一次（即本工具第一次改 hosts
+    之前），之后任何一次写入都不再动它。这样原始 hosts 不会被后续的
+    pinned 版本覆盖掉。
     """
     path = path or hosts_path()
 
-    if backup and os.path.exists(path):
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        shutil.copy2(path, f"{path}.bak.{stamp}")
+    # 编码必须以「即将被替换的那个文件」为准，而不是依赖上一次 read_hosts()
+    # 留下的全局值（否则跨文件写、或进程里换过目标路径时会写错编码）。
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as fh:
+                _decode_hosts(fh.read())
+        except OSError:
+            pass
 
+    if backup and os.path.exists(path):
+        backup_hosts_once(path)
+
+    data = encode_hosts(new_text)
     tmp = path + ".cfpin.tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as fh:
-        fh.write(new_text)
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
 
     # 一级：原子替换，最多试 4 次，间隔 0.15s / 0.4s / 0.8s 递增
     for attempt, delay in enumerate((0.15, 0.4, 0.8, 1.5), start=1):
@@ -738,8 +858,10 @@ def write_hosts(new_text, path=None, backup=True):
                 time.sleep(delay)
 
     # 二级：原地重写。保留原文件的 ACL / 属性 / 硬链接，只是不再原子。
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        fh.write(new_text)
+    with open(path, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
     _unlink_quietly(tmp)
     return "in-place"
 
@@ -761,9 +883,9 @@ def flush_dns():
     return False
 
 
-def current_pin():
+def current_pin(text=None):
     """读出当前 hosts 里本工具写入的 IP 和域名"""
-    text = read_hosts()
+    text = read_hosts() if text is None else text
     ips, domains = [], []
     inside = False
     for line in text.splitlines():
@@ -903,7 +1025,15 @@ def cmd_apply(args):
 
     text = read_hosts()
     eol = detect_eol(text)
-    base = strip_block(text)
+    # 标记段不配对时拒绝写入：strip_block 会把 BEGIN 之后的全部内容删掉，
+    # 包括用户自己的 hosts 条目。宁可失败，也不做这种"尽力而为"的破坏。
+    try:
+        base = strip_block(text, force=getattr(args, "force", False))
+    except BrokenBlockError as exc:
+        print(f"\n[X] {exc}。")
+        print("    请先手工检查 hosts 里的 CLOUDFLARE-PIN 标记段；")
+        print("    确认可以删除到文件末尾后，再加 --force 重试。")
+        return 3
     if base and not base.endswith(("\n", "\r")):
         base += eol
     new_text = base + render_block(safe, domains, eol)
@@ -925,7 +1055,9 @@ def cmd_apply(args):
         print(f"  已写入 {hosts_path()}")
         if mode == "in-place":
             print("  （该路径拒绝原子替换，已改为原地重写；结果等价）")
-        print("  原文件已备份为 hosts.bak.<时间戳>，可用 revert 还原。")
+        bak = backup_path()
+        print(f"  原始 hosts 备份：{bak}"
+              f"（只在首次写入前创建一次，之后不再覆盖；可用 revert 还原）")
 
     print("\n" + "=" * 74)
     print("第 4 步：验证效果")
@@ -955,16 +1087,23 @@ def cmd_revert(args):
     if BEGIN_MARK not in text:
         print("hosts 里没有本工具写入的内容，无需还原。")
         return 0
-    ips, domains = current_pin()
-    new_text = strip_block(read_hosts())
+    if block_state(text) == "broken" and not getattr(args, "force", False):
+        print("[X] hosts 里的 CLOUDFLARE-PIN 标记段不完整（BEGIN/END 不成对）：")
+        print("    继续删除会把标记段之后的条目一起删掉，已中止。")
+        print("    请先手工检查；确认可以删除到文件末尾后，再加 --force 重试。")
+        return 3
+    ips, domains = current_pin(text)
+    eol = detect_eol(text)
+    new_text = strip_block(text, force=getattr(args, "force", False))
     if args.dry_run:
         print("（--dry-run 演练）将删除以下内容：")
-        for line in render_block(ips, sorted(set(domains)),
-                                 detect_eol(read_hosts())).splitlines():
+        for line in render_block(ips, sorted(set(domains)), eol).splitlines():
             print("   |", line)
         return 0
     try:
-        mode = write_hosts(new_text)
+        # revert 是删除操作：不再生成备份，免得把已经 pin 过的版本当成
+        # "原始备份"覆盖掉首次运行时留下的那一份。
+        mode = write_hosts(new_text, backup=False)
     except PermissionError:
         print("[X] 权限不足，未改动。")
         return 2
@@ -979,7 +1118,11 @@ def cmd_status(args):
     print("=" * 74)
     print("Cloudflare 优选状态")
     print("=" * 74)
-    ips, domains = current_pin()
+    text = read_hosts()
+    if block_state(text) == "broken":
+        print("  [警告] hosts 里的 CLOUDFLARE-PIN 标记段不完整（BEGIN/END 不成对）。")
+        print("         apply / revert 会拒绝执行，请先手工修复标记段。")
+    ips, domains = current_pin(text)
     if ips:
         print(f"  已启用优选：{', '.join(ips)}")
         print(f"  生效域名  ：{', '.join(domains)}")
@@ -1066,11 +1209,15 @@ def main(argv=None):
     p.add_argument("--strict-colo", action="store_true",
                    help="只考虑近端机房，远端机房不参与候选")
     p.add_argument("--dry-run", action="store_true", help="只演练不写入")
+    p.add_argument("--force", action="store_true",
+                   help="标记段不完整时仍然执行（会删除到文件末尾，慎用）")
     p.add_argument("--hosts-file", help="（自测用）对副本文件操作，不动系统 hosts")
     p.set_defaults(func=cmd_apply)
 
     p = sub.add_parser("revert", help="删除 hosts 中的优选段")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="标记段不完整时仍然执行（会删除到文件末尾，慎用）")
     p.add_argument("--hosts-file", help="（自测用）对副本文件操作")
     p.set_defaults(func=cmd_revert)
 

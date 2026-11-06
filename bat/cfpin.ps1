@@ -29,6 +29,25 @@ function Test-CfElevated {
     return (Test-CfAdmin)
 }
 
+function Get-CfElevatedArguments {
+    # 提权后要传给新进程的参数列表（数组，交给 Start-Process 自己拼）。
+    #
+    # 不要用 -join ' ' 拼字符串：$Action 为空时（无参数启动 → 菜单）会拼出
+    # "... -Action  -KeepOpen"，PowerShell 解析成「-Action 缺少参数」，
+    # 提权窗口一闪而过，选 2/3 等于什么都没做。
+    param(
+        [string]$ActionValue = $Action,
+        [string]$ScriptPath = (Join-Path $PSScriptRoot 'cfpin.ps1')
+    )
+    $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+              '-File', ('"' + $ScriptPath + '"'))
+    if (-not [string]::IsNullOrWhiteSpace($ActionValue)) {
+        $args += @('-Action', $ActionValue)
+    }
+    $args += '-KeepOpen'
+    return $args
+}
+
 function Restart-CfElevated {
     param([string]$Why)
     if ($NoElevate) {
@@ -37,12 +56,7 @@ function Restart-CfElevated {
         Write-Host '  （-NoElevate：不请求提权，操作继续，但写 hosts 会失败）' -ForegroundColor DarkGray
         return
     }
-    $argList = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-File', ('"' + (Join-Path $PSScriptRoot 'cfpin.ps1') + '"'),
-        '-Action', $Action,
-        '-KeepOpen'
-    ) -join ' '
+    $argList = Get-CfElevatedArguments
     Write-Host ''
     Write-Host ('  需要管理员权限：' + $Why) -ForegroundColor Yellow
     Write-Host '  正在请求提权（UAC 窗口请点「是」），结果会在新窗口里显示…' -ForegroundColor Yellow
@@ -208,7 +222,12 @@ function Invoke-CfActionWrite {
     if (@($result.certRejected).Count -gt 0) {
         Write-Host ('  已跳过证书校验未通过的：' + ($result.certRejected -join '、')) -ForegroundColor Yellow
     }
-    Write-Host ('  写入方式：' + $result.mode + ' · 已刷新 DNS 缓存 · 备份在 hosts.bak') -ForegroundColor DarkGray
+    Write-Host ('  写入方式：' + $result.mode + ' · 已刷新 DNS 缓存') -ForegroundColor DarkGray
+    if ($result.backupCreated) {
+        Write-Host ('  原始 hosts 备份：' + $result.backup + '（仅本次首次写入前创建）') -ForegroundColor DarkGray
+    } elseif ($result.backup) {
+        Write-Host ('  备份已存在，未覆盖：' + $result.backup + '（备份只在首次运行时创建）') -ForegroundColor DarkGray
+    }
 
     $newPin = Get-CfCurrentPin (Read-CfHostsText)
     Write-Host ''

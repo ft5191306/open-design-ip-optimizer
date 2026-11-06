@@ -15,6 +15,15 @@ $script:CfLogFile = Join-Path $PSScriptRoot 'cfpin.log'
 $script:CfStateFile = Join-Path $script:CfDataDir 'state.json'
 $script:CfConfigFile = Join-Path $script:CfDataDir 'config.json'
 
+# hosts 的编码/BOM：Read-CfHostsText 探测后记在这里，Write-CfHostsText 沿用同一组。
+# 中文 Windows 上的 hosts 常被存成 ANSI/GBK 甚至 UTF-16，用 UTF-8 强读强写会把
+# 中文注释永久替换成 U+FFFD（无法还原），所以必须保持原编码写回。
+$script:CfHostsEncoding = New-Object System.Text.UTF8Encoding($false)
+$script:CfHostsPreamble = [byte[]]@()
+# 本次写入是否新建了备份（备份只在首次运行时创建一次）
+$script:CfBackupCreated = $false
+
+
 # ---------------------------------------------------------------- 常量
 # 全部照抄插件 lib/probe.js 与 lib/engine.js，改任何一个都要先看那边的注释。
 $script:BEGIN_MARK = '# >>> CLOUDFLARE-PIN BEGIN (managed by cf_pin.py) >>>'
@@ -607,9 +616,65 @@ function Get-CfHostsPath {
     return (Join-Path $root 'System32\drivers\etc\hosts')
 }
 
+function Get-CfAnsiEncoding {
+    # 系统 ANSI 代码页（中文 Windows 一般是 936）。拿不到就用 latin-1：
+    # 它对任意字节都能严格往返，至少保证写回不损坏原文件。
+    try {
+        $cp = [Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage
+        if ($cp -gt 0) { return [Text.Encoding]::GetEncoding($cp) }
+    } catch { }
+    return [Text.Encoding]::GetEncoding(28591)
+}
+
 function Read-CfHostsText {
     param([string]$Path = (Get-CfHostsPath))
-    return [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $script:CfHostsPreamble = [byte[]]@()
+
+    # 1) BOM 优先：UTF-8 / UTF-16 LE / UTF-16 BE
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $script:CfHostsPreamble = [byte[]]@(0xEF, 0xBB, 0xBF)
+        $script:CfHostsEncoding = New-Object System.Text.UTF8Encoding($false)
+        return $script:CfHostsEncoding.GetString($bytes, 3, $bytes.Length - 3)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+        $script:CfHostsPreamble = [byte[]]@(0xFF, 0xFE)
+        $script:CfHostsEncoding = [Text.Encoding]::GetEncoding(1200)   # UTF-16 LE
+        return $script:CfHostsEncoding.GetString($bytes, 2, $bytes.Length - 2)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+        $script:CfHostsPreamble = [byte[]]@(0xFE, 0xFF)
+        $script:CfHostsEncoding = [Text.Encoding]::GetEncoding(1201)   # UTF-16 BE
+        return $script:CfHostsEncoding.GetString($bytes, 2, $bytes.Length - 2)
+    }
+
+    # 2) 严格 UTF-8：能无损解码就用它（大多数 hosts 都是这一档）
+    $strict = New-Object System.Text.UTF8Encoding -ArgumentList $false, $true
+    try {
+        $text = $strict.GetString($bytes)
+        $script:CfHostsEncoding = $strict
+        return $text
+    } catch { }
+
+    # 3) 系统 ANSI（中文 Windows 上是 cp936）：能无损编码回去才算数
+    $ansi = Get-CfAnsiEncoding
+    try {
+        $text = $ansi.GetString($bytes)
+        $null = $ansi.GetBytes($text)
+        $script:CfHostsEncoding = $ansi
+        return $text
+    } catch { }
+
+    # 4) latin-1 兜底：任意字节可严格往返，最坏也只是显示成乱码
+    $script:CfHostsEncoding = [Text.Encoding]::GetEncoding(28591)
+    return $script:CfHostsEncoding.GetString($bytes)
+}
+
+function Get-CfHostsBytes {
+    param([string]$Text)
+    $body = $script:CfHostsEncoding.GetBytes($Text)
+    if ($script:CfHostsPreamble.Length -eq 0) { return $body }
+    return [byte[]]($script:CfHostsPreamble + $body)
 }
 
 # 复刻 Python str.splitlines(keepends=True) 的切分集合
@@ -626,6 +691,32 @@ function Get-CfLines {
 function Get-CfPyStrip {
     param([string]$Value)
     return $Value.Trim([char[]]@("`t","`n","`v","`f","`r"," ", [char]0x1c, [char]0x1d, [char]0x1e, [char]0x1f, [char]0x85, [char]0xA0))
+}
+
+function Get-CfPinBlockState {
+    # 标记段状态："none"（没有）/ "ok"（成对）/ "broken"（不配对）。
+    # "broken" 包括：只有 BEGIN 没有 END、END 出现在 BEGIN 之前、BEGIN 嵌套。
+    # 这种时候删标记段会把 BEGIN 之后的全部内容一起删掉，调用方必须 fail-closed。
+    param([string]$Text)
+    $inside = $false
+    $pairs = 0
+    foreach ($line in (Get-CfLines $Text)) {
+        $bare = Get-CfPyStrip $line
+        if ($bare -eq $script:BEGIN_MARK) {
+            if ($inside) { return 'broken' }
+            $inside = $true
+            continue
+        }
+        if ($bare -eq $script:END_MARK) {
+            if (-not $inside) { return 'broken' }
+            $inside = $false
+            $pairs++
+            continue
+        }
+    }
+    if ($inside) { return 'broken' }
+    if ($pairs -gt 0) { return 'ok' }
+    return 'none'
 }
 
 function Remove-CfPinBlock {
@@ -679,6 +770,9 @@ function Get-CfEol {
 
 function New-CfComposedHosts {
     param([string]$Text, [string[]]$Ips, [string[]]$Domains)
+    if ((Get-CfPinBlockState $Text) -eq 'broken') {
+        throw 'hosts 里的 CLOUDFLARE-PIN 标记段不完整（BEGIN/END 不成对），已中止写入以免误删标记段之后的条目'
+    }
     $eol = Get-CfEol $Text
     $base = Remove-CfPinBlock $Text
     if ($base.Length -gt 0 -and -not ($base.EndsWith("`r") -or $base.EndsWith("`n"))) { $base += $eol }
@@ -686,14 +780,24 @@ function New-CfComposedHosts {
 }
 
 # 备份 + 原子替换（4 次退避）+ 原地重写兜底，与插件 hosts.js 一致
+#
+# 备份策略：只在「备份文件还不存在」时创建一次（本工具第一次改 hosts 之前），
+# 之后任何一次写入都不再动它。旧版每次写入都用 -Force 覆盖同名 hosts.bak，
+# 第二次写入就会把真正的原始 hosts 顶掉，等于没有备份。
 function Write-CfHostsText {
     param([string]$Text, [string]$Path = (Get-CfHostsPath), [switch]$NoBackup)
-    if (-not $NoBackup -and (Test-Path -LiteralPath $Path)) {
-        Copy-Item -LiteralPath $Path -Destination ($Path + '.bak') -Force
+    $script:CfBackupCreated = $false
+    $bak = $Path + '.bak'
+    if (-not $NoBackup -and (Test-Path -LiteralPath $Path) -and -not (Test-Path -LiteralPath $bak)) {
+        Copy-Item -LiteralPath $Path -Destination $bak
+        $script:CfBackupCreated = $true
     }
+    # 编码以「即将被替换的这个文件」为准（顺便刷新全局编码），
+    # 不能依赖上一次读取留下的状态。
+    if (Test-Path -LiteralPath $Path) { $null = Read-CfHostsText $Path }
+    $bytes = Get-CfHostsBytes $Text
     $tmp = $Path + '.cfpin.tmp'
-    $enc = New-Object System.Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($tmp, $Text, $enc)
+    [IO.File]::WriteAllBytes($tmp, $bytes)
     # 一级：原子替换。hosts 被 DNS 客户端 / 杀软 / 索引器短暂占用是常态，
     # 那种失败几十毫秒后自己就消失，所以退避重试而不是立刻报权限不足。
     $delays = @(150, 400, 800, 1500)
@@ -705,7 +809,7 @@ function Write-CfHostsText {
         Start-Sleep -Milliseconds $delays[$i]
     }
     # 二级：原地重写（保留 ACL / 属性）
-    [IO.File]::WriteAllText($Path, $Text, $enc)
+    [IO.File]::WriteAllBytes($Path, $bytes)
     try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch { }
     return 'in-place'
 }
@@ -1155,6 +1259,11 @@ function Invoke-CfApply {
     try {
         $path = Get-CfHostsPath
         $text = Read-CfHostsText $path
+        # 标记段不配对时直接拒绝：后面 Remove-CfPinBlock 会把 BEGIN 之后的
+        # 全部内容删掉（包括用户自己的 hosts 条目），这种破坏不可接受。
+        if ((Get-CfPinBlockState $text) -eq 'broken') {
+            return @{ ok = $false; reason = 'hosts 里的 CLOUDFLARE-PIN 标记段不完整（BEGIN/END 不成对），继续写入会误删标记段之后的条目，已中止；请先手工修复 hosts' }
+        }
         # 写入的域名 = WriteDomains（默认 addresses ∪ writeAddresses）。
         # 只写不做证书校验的域名（open-design.ai 这类）：它与探测域名同属一个
         # zone、同一张边缘证书，闸门在 addresses 上已经验过这条 IP 能为该 zone
@@ -1166,7 +1275,9 @@ function Invoke-CfApply {
         $state.switchLog += [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
         Save-CfState $state
         Write-CfLog ("写入 hosts：{0} -> {1}（{2}）{3}" -f ($WriteDomains -join ','), ($ips -join ','), $mode, $(if ($degraded) { ' [降级]' } else { '' }))
-        return @{ ok = $true; ips = $ips; domains = $WriteDomains; degraded = $degraded; mode = $mode; certRejected = $certRejected }
+        return @{ ok = $true; ips = $ips; domains = $WriteDomains; degraded = $degraded; mode = $mode;
+                  certRejected = $certRejected; backup = ($path + '.bak');
+                  backupCreated = [bool]$script:CfBackupCreated }
     } catch {
         return @{ ok = $false; reason = "写 hosts 失败：$($_.Exception.Message)" }
     }

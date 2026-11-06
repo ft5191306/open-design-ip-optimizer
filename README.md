@@ -128,11 +128,13 @@ Windows 自带的 PowerShell 5.1 直接跑，不用装 Python。双击 `bat/cfpi
 
 ## 安全
 
-- 写入前备份原 hosts 为 `hosts.bak.<时间戳>`
-- 只修改带 `CLOUDFLARE-PIN` 标记的那一段，其余内容一字不动
+- 备份：第一次改写 hosts 时把原文件复制为 `hosts.bak`，之后**不再覆盖**（旧版每次写入都生成新备份，同秒内会互相覆盖，反而丢掉原始文件）
+- 编码保持原样：GBK/ANSI、UTF-8（含 BOM）、UTF-16 的 hosts 都用原编码写回，不会把中文注释改成乱码
+- 只修改带 `CLOUDFLARE-PIN` 标记的那一段，其余内容不动
+- 标记段不完整（只有 BEGIN 没有 END、或 END 在前）时**拒绝写入**，避免把标记段之后的条目一起删掉；确认可以删到文件末尾时用 `--force` 强行执行
 - 写入前逐个域名校验证书，校验不过不写
-- 原子替换失败时自动退化为原地重写，不会留下半截文件
-- 一条命令还原：`python cf_pin.py revert`
+- 原子替换失败时自动退化为原地重写
+- 一条命令还原：`python cf_pin.py revert`（`revert` 不会再生成备份）
 
 ## 环境
 
